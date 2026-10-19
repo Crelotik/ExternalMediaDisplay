@@ -1,0 +1,13 @@
+# PlatformIO
+.pio/
+.venv/
+build/
+
+# VS Code
+.vscode/
+*.code-workspace
+
+# OS specific files
+.DS_Store
+Thumbs.db
+desktop.ini
