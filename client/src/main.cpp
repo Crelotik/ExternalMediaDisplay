@@ -301,8 +301,8 @@ static void ui_init() {
 
     // сверху вниз: обложка, название, исполнитель, таймлайн, строка времени
     const int innerW  = RIGHT_W - 8;                 // 252
-    const int coverY  = 0;
-    const int titleY  = coverY + COVER_SIZE + 6;
+    const int coverY  = 8;
+    const int titleY  = coverY + COVER_SIZE + 10;
     const int artistY = titleY + lh + 2;
     const int barY    = artistY + lh + 8;
     const int timeY   = barY + 6 + 4;
