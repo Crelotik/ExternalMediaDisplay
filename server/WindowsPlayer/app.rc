@@ -1,0 +1,7 @@
+// Application resources: the icon embedded into the exe (Explorer, window title, tray).
+// icons\\app.ico must be located next to this file.
+// Build:  rc /nologo app.rc   (produces app.res; pass it to cl together with media_server.cpp)
+
+#define IDI_APPICON 1
+
+IDI_APPICON ICON "icons\\app.ico"

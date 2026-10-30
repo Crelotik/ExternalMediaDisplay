@@ -5,14 +5,17 @@
 //  таблицу «приложение -> слот 0..15» и общается с RP2040 по USB CDC.
 //
 //  Сборка (x64 Native Tools Command Prompt for VS, Windows 10 SDK >= 17763):
-//      cl /std:c++20 /EHsc /utf-8 /permissive- media_server.cpp
+//      rc /nologo app.rc
+//      cl /std:c++20 /EHsc /utf-8 /permissive- media_server.cpp app.res
+//  Ключ /utf-8 обязателен (кириллица в надписях и журнале), файл должен быть сохранён в UTF-8.
+//  app.rc встраивает значок icons\app.ico в exe; без него программа берёт icons\app.ico с диска.
 //  Запуск:
 //      media_server.exe [COM8] [--tray] [--dump-thumbs]
 //        --tray          стартовать скрытым: только значок в трее
 //        --dump-thumbs   сохранять исходные миниатюры в папку thumbs (для настройки обрезки)
 //  Окно журнала: крестик сворачивает программу в трей; левый щелчок по значку
 //  открывает окно, правый показывает меню («Показать окно», «Выход»).
-//  Значок трея: icons\app.ico (необязательно). Консоль не нужна: подсистема Windows.
+//  Значок окна и трея: из ресурсов exe (app.rc), иначе из файла icons\app.ico. Консоль не нужна: подсистема Windows.
 //  Окно: выбор порта, список медиасессий с ползунком громкости, галочка обрезки
 //  обложки Spotify, состояние дисплея. Настройки хранятся в settings.ini рядом с exe.
 //  Громкость приложений: команды 0x10..0x12, управление треком: команда 0x0F
@@ -67,6 +70,11 @@
 #pragma comment(lib, "comctl32")
 // современный вид стандартных элементов (список, ползунок, галочка)
 #pragma comment(linker, "/manifestdependency:\"type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
+
+// Кириллица в строках: файл должен быть сохранён в UTF-8 и собираться с ключом /utf-8, иначе
+// надписи в окне и журнал превращаются в «кракозябры». Проверяем это прямо при сборке.
+static_assert((unsigned char)"я"[0] == 0xD1 && (unsigned char)"я"[1] == 0x8F && L"я"[0] == 0x044F,
+    "Build with /utf-8 and keep this file saved as UTF-8 (see the comment at the top of the file).");
 
 using namespace winrt;
 using namespace Windows::Media::Control;
@@ -165,7 +173,7 @@ struct KnownApp { const wchar_t* key; const wchar_t* name; };
 static const KnownApp kKnownApps[] = {
     { L"spotify",      L"Spotify" },
     { L"yandexmusic",  L"Яндекс Музыка" },
-    { L"yandex.music", L"Яндекс.Музыка" },
+    { L"yandex.music", L"Яндекс Музыка" },
     { L"msedge",       L"Edge" },
     { L"chrome",       L"Chrome" },
     { L"firefox",      L"Firefox" },
@@ -597,7 +605,8 @@ static const wchar_t* kWndClass = L"ExternalDisplayMediaServerWnd";
 static std::atomic<bool> g_running{ true };
 static HWND   g_hwnd = nullptr;
 static HWND   g_edit = nullptr;
-static HICON  g_icon = nullptr;
+static HICON  g_icon = nullptr;             // большой значок (окно, панель задач)
+static HICON  g_iconSmall = nullptr;        // маленький значок (заголовок окна, трей)
 static HFONT  g_font = nullptr;
 static HBRUSH g_bgBrush = nullptr;
 static UINT   g_wmTaskbarCreated = 0;
@@ -689,10 +698,16 @@ static void showMainWindow() {
     SetForegroundWindow(g_hwnd);
 }
 
-static HICON loadTrayIcon() {                         // icons\app.ico, иначе стандартная иконка
+constexpr int IDI_APPICON = 1;                         // идентификатор значка в ресурсах exe (см. app.rc)
+
+// значок нужного размера: 1) из ресурсов exe, 2) из файла icons\app.ico рядом с exe, 3) стандартный
+static HICON loadWindowIcon(int size) {
+    HANDLE h = LoadImageW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDI_APPICON), IMAGE_ICON, size, size, LR_DEFAULTCOLOR);
+    if (h) return (HICON)h;
+
     std::wstring path = exeDir() + L"\\icons\\app.ico";
     if (GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES) {
-        HANDLE h = LoadImageW(nullptr, path.c_str(), IMAGE_ICON, 0, 0, LR_LOADFROMFILE | LR_DEFAULTSIZE);
+        h = LoadImageW(nullptr, path.c_str(), IMAGE_ICON, size, size, LR_LOADFROMFILE);
         if (h) return (HICON)h;
     }
     return LoadIconW(nullptr, IDI_APPLICATION);
@@ -705,7 +720,7 @@ static void trayAdd() {
     g_nid.uID = TRAY_ID;
     g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     g_nid.uCallbackMessage = WM_TRAY;
-    g_nid.hIcon = g_icon;
+    g_nid.hIcon = g_iconSmall;
     wcscpy_s(g_nid.szTip, L"Внешний дисплей: сервер");
     Shell_NotifyIconW(NIM_ADD, &g_nid);
 }
@@ -793,17 +808,20 @@ static LRESULT CALLBACK wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 
 static bool createMainWindow(HINSTANCE hi, bool startHidden) {
     g_wmTaskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
-    g_icon = loadTrayIcon();
+    g_icon = loadWindowIcon(GetSystemMetrics(SM_CXICON));
+    g_iconSmall = loadWindowIcon(GetSystemMetrics(SM_CXSMICON));
     g_bgBrush = CreateSolidBrush(RGB(24, 24, 24));    // фон окна журнала
 
-    WNDCLASSW wc{};
+    WNDCLASSEXW wc{};
+    wc.cbSize = sizeof(wc);
     wc.lpfnWndProc = wndProc;
     wc.hInstance = hi;
     wc.lpszClassName = kWndClass;
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     wc.hIcon = g_icon;
+    wc.hIconSm = g_iconSmall;
     wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
-    if (!RegisterClassW(&wc)) return false;
+    if (!RegisterClassExW(&wc)) return false;
 
     g_hwnd = CreateWindowExW(0, kWndClass, L"Внешний дисплей: сервер", WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT, CW_USEDEFAULT, 720, 660, nullptr, nullptr, hi, nullptr);
@@ -860,7 +878,7 @@ static void dumpThumbnail(IRandomAccessStreamReference const& thumb, const std::
         DWORD wr = 0;
         WriteFile(f, bytes.data(), (DWORD)bytes.size(), &wr, nullptr);
         CloseHandle(f);
-        logLine("[d] the thumbnail has been saved: thumbs\\%s\n", toUtf8(name).c_str());
+        logLine("[d] миниатюра сохранена: thumbs\\%s\n", toUtf8(name).c_str());
     }
     catch (...) {
     }
@@ -1069,9 +1087,9 @@ static void pushVolume() {
         uint8_t b[4] = { id, (uint8_t)vi.level, (uint8_t)(vi.mute ? 1 : 0), (uint8_t)(vi.available ? 1 : 0) };
         if (!sendPacket(CMD_VOLUME_STATE, b, sizeof(b))) return false;
         if (vi.available)
-            logLine("[v] %s: volume %d%%%s\n", g_slots[id].name.c_str(), vi.level, vi.mute ? " (sound is off)" : "");
+            logLine("[v] %s: громкость %d%%%s\n", g_slots[id].name.c_str(), vi.level, vi.mute ? " (звук выключен)" : "");
         else
-            logLine("[v] %s: volume is unavailable (no audio session)\n", g_slots[id].name.c_str());
+            logLine("[v] %s: громкость недоступна (нет аудиосессии)\n", g_slots[id].name.c_str());
         return true;
         });
 }
@@ -1194,14 +1212,14 @@ static void onPortApply() {
     g_mcuSeen = false;
     g_retryDelayMs = 1000;
     g_portChanged = true;                                           // главный цикл подключится сразу, в фоновом потоке
-    logLine("[*] connecting to port %s\n", toUtf8(g_portName).c_str());
+    logLine("[*] подключение к порту %s\n", toUtf8(g_portName).c_str());
 }
 
 // ---- обрезка Spotify ----
 static void onCropToggled() {
     g_spotifyCrop = SendMessageW(g_cropCheck, BM_GETCHECK, 0, 0) == BST_CHECKED;
     saveSettings();
-    logLine("[*] trimming the cover Spotify is: %s\n", g_spotifyCrop ? "on" : "off");
+    logLine("[*] обрезка обложки Spotify: %s\n", g_spotifyCrop ? "включена" : "выключена");
     // если сейчас на дисплее Spotify, обложка пересчитывается с новыми настройками
     if (g_selected >= 0 && g_slots[g_selected].used && g_slots[g_selected].iconKey == L"spotify") {
         g_cur.cs = CoverState::Pending;
@@ -1284,7 +1302,7 @@ static void onSessionDoubleClick() {
     int id = (int)SendMessageW(g_sessList, LB_GETITEMDATA, i, 0);
     if (id < 0 || id >= MAX_SESSIONS || !g_slots[id].used) return;
     if (!g_port.isOpen() || !g_slots[id].known) {
-        logLine("[!] display is not connected: the session cannot be displayed\n");
+        logLine("[!] дисплей не подключён: показать сессию нельзя\n");
         return;
     }
     uint8_t p[1] = { (uint8_t)id };
@@ -1378,7 +1396,7 @@ static void createControls(HINSTANCE hi) {
         g_uiFont = CreateFontIndirectW(&ncm.lfMessageFont);        // шрифт, как в остальных окнах Windows
 
     wchar_t cropText[96];
-    swprintf_s(cropText, L"Обрезать обложку Spotify (на %d%%)", (int)std::lround(SPOTIFY_CROP_BOTTOM * 100));
+    swprintf_s(cropText, L"Обрезать обложку Spotify (%d%% снизу)", (int)std::lround(SPOTIFY_CROP_BOTTOM * 100));
 
     g_lblPort = mkChild(hi, L"STATIC", L"Порт:", SS_LEFT, 0);
     g_portCombo = mkChild(hi, L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, IDC_PORT_COMBO);
@@ -1583,7 +1601,7 @@ static bool requestManager() {
         return true;
     }
     catch (hresult_error const& e) {
-        logLine("[!] unable to retrieve the media session manager: %s\n", toUtf8(std::wstring(e.message().c_str())).c_str());
+        logLine("[!] не удалось получить менеджер медиасессий: %s\n", toUtf8(std::wstring(e.message().c_str())).c_str());
         return false;
     }
 }
@@ -1596,7 +1614,7 @@ static void syncSessions() {
         static int lastCount = -1;
         if ((int)winSessions.Size() != lastCount) {                       // диагностика: что именно сообщает Windows
             lastCount = (int)winSessions.Size();
-            logLine("[~] Windows Reports Media Sessions: %d\n", lastCount);
+            logLine("[~] Windows сообщает о медиасессиях: %d\n", lastCount);
         }
         for (auto const& s : winSessions) {
             std::wstring appId(s.SourceAppUserModelId().c_str());
@@ -1620,9 +1638,9 @@ static void syncSessions() {
                 n.iconKey = ai.iconKey;
                 n.icon = loadAppIcon(ai.iconKey, n.color);
                 isNew = true;
-                logLine("[+] session %d: %s [%s]\n", idx, n.name.c_str(),
-                    n.icon.empty() ? ("no icon: icons\\" + toUtf8(ai.iconKey) + ".png").c_str()
-                    : "icon loaded");
+                logLine("[+] слот %d: %s [%s]\n", idx, n.name.c_str(),
+                    n.icon.empty() ? ("нет иконки: icons\\" + toUtf8(ai.iconKey) + ".png").c_str()
+                    : "иконка загружена");
             }
             g_slots[idx].session = s;                 // актуальный объект сессии
             seen[idx] = true;
@@ -1634,7 +1652,7 @@ static void syncSessions() {
         ULONGLONG t = GetTickCount64();
         if (t - lastLog > 10000) {
             lastLog = t;
-            logLine("[!] media session read error: %s\n", toUtf8(std::wstring(e.message().c_str())).c_str());
+            logLine("[!] ошибка чтения медиасессий: %s\n", toUtf8(std::wstring(e.message().c_str())).c_str());
         }
         g_mgrRequestedAt = 0;                         // следующий проход заново запросит менеджер
         return;                                       // при ошибке слоты не трогаем
@@ -1643,7 +1661,7 @@ static void syncSessions() {
     for (int i = 0; i < MAX_SESSIONS; i++) {
         Slot& s = g_slots[i];
         if (!s.used || seen[i]) continue;
-        logLine("[-] session %d: %s\n", i, s.name.c_str());
+        logLine("[-] слот %d: %s\n", i, s.name.c_str());
         if (g_port.isOpen()) { uint8_t p[1] = { (uint8_t)i }; sendPacket(CMD_DELETE_MEDIASESSION, p, 1); }
         if (g_selected == i) deselect();              // МК сам выберет другую и пришлёт SELECT
         s = Slot{};
@@ -1664,7 +1682,7 @@ static void doResync() {
         if (g_slots[i].used) sendCreate(i);           // МК сам выберет первый и пришлёт SELECT
     if (g_port.isOpen()) {
         g_needResync = false;
-        logLine("[*] MC synchronized\n");
+        logLine("[*] МК синхронизирован\n");
     }
 }
 
@@ -1672,18 +1690,18 @@ static void doResync() {
 static bool runControl(int id, int action) {
     if (id < 0 || id >= MAX_SESSIONS || !g_slots[id].used || !g_slots[id].session) return false;
 
-    const char* what = "unknown action";
+    const char* what = "неизвестное действие";
     bool ok = false;
     try {
         Session s = g_slots[id].session;
         Windows::Foundation::IAsyncOperation<bool> op{ nullptr };
         switch (action) {
-        case CTRL_PLAY_PAUSE: what = "play/pause";       op = s.TryTogglePlayPauseAsync(); break;
-        case CTRL_NEXT:       what = "next track";     op = s.TrySkipNextAsync();        break;
-        case CTRL_PREV:       what = "previous track";    op = s.TrySkipPreviousAsync();    break;
-        case CTRL_PLAY:       what = "play";             op = s.TryPlayAsync();            break;
-        case CTRL_PAUSE:      what = "pause";              op = s.TryPauseAsync();           break;
-        case CTRL_STOP:       what = "stop";               op = s.TryStopAsync();            break;
+        case CTRL_PLAY_PAUSE: what = "играть/пауза";       op = s.TryTogglePlayPauseAsync(); break;
+        case CTRL_NEXT:       what = "следующий трек";     op = s.TrySkipNextAsync();        break;
+        case CTRL_PREV:       what = "предыдущий трек";    op = s.TrySkipPreviousAsync();    break;
+        case CTRL_PLAY:       what = "играть";             op = s.TryPlayAsync();            break;
+        case CTRL_PAUSE:      what = "пауза";              op = s.TryPauseAsync();           break;
+        case CTRL_STOP:       what = "стоп";               op = s.TryStopAsync();            break;
         }
         // приложение может не отвечать: ждём не дольше 1,5 секунды, чтобы не вешать программу
         if (op && op.wait_for(std::chrono::milliseconds(1500)) == Windows::Foundation::AsyncStatus::Completed)
@@ -1691,7 +1709,7 @@ static bool runControl(int id, int action) {
     }
     catch (hresult_error const&) {
     }
-    logLine("[c] %s: %s%s\n", g_slots[id].name.c_str(), what, ok ? "" : " (not completed)");
+    logLine("[c] %s: %s%s\n", g_slots[id].name.c_str(), what, ok ? "" : " (не выполнено)");
     return ok;
 }
 
@@ -1702,7 +1720,7 @@ static void handleSelect(int id) {
     g_selected = id;
     g_cur = Track{};
     g_sent = Sent{};
-    logLine("[>] selected session %d: %s\n", id, g_slots[id].name.c_str());
+    logLine("[>] выбран слот %d: %s\n", id, g_slots[id].name.c_str());
     updateSelected();
     pushVolume();
 }
@@ -1734,9 +1752,9 @@ int wmain(int argc, wchar_t** argv) {
     crcInit();
     if (!createMainWindow(GetModuleHandleW(nullptr), startHidden)) return 1;
 
-    logLine("Port: %s. The 'X' in the window minimizes the program to the system tray; click the icon in the system tray to exit..\n",
+    logLine("Порт: %s. Крестик окна сворачивает программу в трей, выход через значок в трее.\n",
         toUtf8(g_portName).c_str());
-    if (g_dumpThumbs) logLine("[d] mode --dump-thumbs: the original thumbnails are saved in the 'thumbs' folder\\\n");
+    if (g_dumpThumbs) logLine("[d] режим --dump-thumbs: исходные миниатюры сохраняются в thumbs\\\n");
 
     ULONGLONG lastTry = 0, lastSync = 0, lastUpd = 0;
 
@@ -1746,7 +1764,7 @@ int wmain(int argc, wchar_t** argv) {
 
         // ---- подключение (порт открывается в фоновом потоке, окно не зависает) ----
         if (collectOpenJobs()) {
-            logLine("[*] port %s opened\n", toUtf8(g_portName).c_str());
+            logLine("[*] порт %s открыт\n", toUtf8(g_portName).c_str());
             g_mcuSeen = false;
             g_parser.reset();
             deselect();
@@ -1771,7 +1789,7 @@ int wmain(int argc, wchar_t** argv) {
             size_t n;
             while ((n = g_port.read(buf, sizeof(buf))) > 0)
                 for (size_t i = 0; i < n; i++) g_parser.feed(buf[i]);
-            if (!g_port.isOpen()) logLine("[!] port, waiting for reconnection\n");
+            if (!g_port.isOpen()) logLine("[!] порт закрыт, ждём переподключения\n");
         }
 
         // ---- входящие от МК ----

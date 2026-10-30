@@ -4,6 +4,8 @@
 //
 //  Экран:  [ иконки сессий 60x240 ][ обложка, название, таймлайн 260x240 ]
 //  Кнопки: BTN_UP / BTN_DOWN переключают выбранную медиасессию.
+//  Энкодер KY-040: вращение меняет громкость выбранного приложения (плашка с плавным
+//  появлением), вращение с нажатой кнопкой переключает медиасессии.
 //
 //  Требования к lv_conf.h:
 //    LV_COLOR_DEPTH 16, LV_USE_BAR 1, LV_USE_LABEL 1,
@@ -66,6 +68,17 @@ constexpr uint16_t MAX_PAYLOAD  = 6 + COVER_SIZE * COVER_SIZE * 2;   // 32774
 constexpr uint8_t BTN_UP_PIN   = 14;   // кнопки на GND, внутренняя подтяжка
 constexpr uint8_t BTN_DOWN_PIN = 15;
 
+// энкодер KY-040 (на модуле есть подтяжки, но внутреннюю тоже включаем). Питание модуля: 3.3 В!
+constexpr uint8_t  ENC_CLK_PIN = 10;
+constexpr uint8_t  ENC_DT_PIN  = 11;
+constexpr uint8_t  ENC_SW_PIN  = 12;
+constexpr bool     ENCODER_REVERSE = false;       // true, если вращение по часовой стрелке должно уменьшать громкость
+constexpr int      VOLUME_STEP_PERCENT = 2;       // громкость за один щелчок энкодера
+constexpr uint32_t VOLUME_OVERLAY_MS   = 1800;    // сколько плашка громкости остаётся на экране после последнего изменения
+constexpr uint32_t VOLUME_FADE_IN_MS   = 180;     // плавное появление
+constexpr uint32_t VOLUME_FADE_OUT_MS  = 300;     // плавное исчезновение
+constexpr uint32_t ENC_SELECT_NOTIFY_MS = 150;    // ПК узнаёт о выбранной энкодером сессии, когда вращение остановилось
+
 // ----------------------------------------------------------------------------
 //  Протокол
 // ----------------------------------------------------------------------------
@@ -87,6 +100,9 @@ enum CommandID : uint8_t {
     CMD_APP_ICON               = 0x0C,
     CMD_APPS_BACKGROUND_COLOR  = 0x0D,   // RGB565, big-endian
     CMD_TRACK_BACKGROUND_COLOR = 0x0E,   // RGB565, big-endian
+    CMD_VOLUME_STEP            = 0x10,   // МК -> ПК: [id][int8 шаг в процентах]
+    CMD_VOLUME_MUTE            = 0x11,   // МК -> ПК: [id][0 включить звук, 1 выключить, 2 переключить] (пока не используется)
+    CMD_VOLUME_STATE           = 0x12,   // ПК -> МК: [id][громкость 0..100][mute 0/1][доступна 0/1]
 };
 
 // ---- CRC8 (ВАЖНО: подгоните под вашу реализацию на ПК!) --------------------
@@ -139,6 +155,10 @@ struct CurrentTrack {                // данные только выбранн
     uint8_t  state;                  // 0 stop, 1 play, 2 pause, 3 error
     uint16_t bgColor;                // 0 = не задан
     bool     hasCover;
+    uint8_t  volLevel;               // громкость приложения 0..100 (из CMD_VOLUME_STATE)
+    bool     volMute;
+    bool     volAvail;               // у приложения есть аудиосессия
+    bool     volKnown;               // состояние громкости уже получено от ПК
 };
 static CurrentTrack cur;
 alignas(4) static uint16_t cover[COVER_SIZE * COVER_SIZE];   // 32 КБ
@@ -227,6 +247,10 @@ static lv_obj_t *coverImg, *coverPlaceholder;
 static lv_obj_t *dimOverlay, *pauseIcon;      // затемнение и знак «||» поверх обложки
 static lv_obj_t *progressBar, *timeLbl, *durLbl, *appLbl;
 static lv_obj_t *offlineOverlay;              // «Сервер не запущен»
+static lv_obj_t *volPanel, *volTitleLbl, *volValueLbl, *volBar;   // плашка громкости
+static bool     volShown = false;             // плашка должна быть видна (цель анимации)
+static uint8_t  volFade = 0;                  // 0..255: текущая прозрачность плашки
+static uint32_t volHideAtMs = 0;              // когда начать скрывать
 
 static lv_image_dsc_t coverDsc;
 static lv_image_dsc_t iconDsc[MAX_SESSIONS];
@@ -268,6 +292,84 @@ static void setPauseVisual(bool paused, bool animate) {
     lv_anim_start(&a);
 }
 
+// кадр анимации плашки: v = 0 (скрыта) ... 255 (полностью видна).
+// Прозрачность задаётся каждому элементу отдельно: «групповая» прозрачность объекта
+// потребовала бы отдельный слой в памяти LVGL.
+static void volFadeCb(void *var, int32_t v) {
+    (void)var;
+    volFade = (uint8_t)v;
+    if (v <= 0) {
+        lv_obj_add_flag(volPanel, LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+    lv_obj_remove_flag(volPanel, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_style_bg_opa(volPanel, (lv_opa_t)v, 0);
+    lv_obj_set_style_text_opa(volTitleLbl, (lv_opa_t)v, 0);
+    lv_obj_set_style_text_opa(volValueLbl, (lv_opa_t)v, 0);
+    lv_obj_set_style_bg_opa(volBar, (lv_opa_t)v, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(volBar, (lv_opa_t)v, LV_PART_INDICATOR);
+}
+
+static void setVolumeFade(bool show, bool animate) {
+    int32_t target = show ? 255 : 0;
+    lv_anim_delete(volPanel, volFadeCb);                       // прервать текущую анимацию
+    if (!animate) { volFadeCb(volPanel, target); return; }
+    if (volFade == target) return;
+
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, volPanel);
+    lv_anim_set_exec_cb(&a, volFadeCb);
+    lv_anim_set_values(&a, volFade, target);                   // с текущего уровня, без скачка
+    lv_anim_set_duration(&a, show ? VOLUME_FADE_IN_MS : VOLUME_FADE_OUT_MS);
+    lv_anim_set_path_cb(&a, show ? lv_anim_path_ease_out : lv_anim_path_ease_in);
+    lv_anim_start(&a);
+}
+
+// текст и полоса плашки по последнему известному состоянию громкости
+static void ui_volumeContent() {
+    char buf[8];
+    if (!cur.volKnown) {
+        lv_label_set_text(volTitleLbl, "Громкость");
+        lv_label_set_text(volValueLbl, "--");
+        lv_bar_set_value(volBar, 0, LV_ANIM_ON);
+    } else if (!cur.volAvail) {
+        lv_label_set_text(volTitleLbl, "Нет звука");
+        lv_label_set_text(volValueLbl, "");
+        lv_bar_set_value(volBar, 0, LV_ANIM_ON);
+    } else if (cur.volMute) {
+        lv_label_set_text(volTitleLbl, "Без звука");
+        lv_label_set_text(volValueLbl, "");
+        lv_bar_set_value(volBar, 0, LV_ANIM_ON);
+    } else {
+        lv_label_set_text(volTitleLbl, "Громкость");
+        snprintf(buf, sizeof(buf), "%u%%", (unsigned)cur.volLevel);
+        lv_label_set_text(volValueLbl, buf);
+        lv_bar_set_value(volBar, cur.volLevel, LV_ANIM_ON);
+    }
+}
+
+// показать плашку (или продлить показ, если она уже видна)
+static void ui_showVolume() {
+    if (selectedId < 0) return;
+    ui_volumeContent();
+    volHideAtMs = millis() + VOLUME_OVERLAY_MS;
+    if (!volShown) {
+        volShown = true;
+        setVolumeFade(true, true);
+    }
+}
+
+static void ui_hideVolume(bool animate) {
+    volShown = false;
+    setVolumeFade(false, animate);
+}
+
+// вызывается из loop(): через VOLUME_OVERLAY_MS без изменений плашка плавно исчезает
+static void ui_volumeTick() {
+    if (volShown && (int32_t)(millis() - volHideAtMs) >= 0) ui_hideVolume(true);
+}
+
 static void ui_init() {
     lv_obj_t *scr = lv_screen_active();
     lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
@@ -301,8 +403,8 @@ static void ui_init() {
 
     // сверху вниз: обложка, название, исполнитель, таймлайн, строка времени
     const int innerW  = RIGHT_W - 8;                 // 252
-    const int coverY  = 8;
-    const int titleY  = coverY + COVER_SIZE + 10;
+    const int coverY  = 0;
+    const int titleY  = coverY + COVER_SIZE + 6;
     const int artistY = titleY + lh + 2;
     const int barY    = artistY + lh + 8;
     const int timeY   = barY + 6 + 4;
@@ -401,6 +503,40 @@ static void ui_init() {
     durLbl = lv_label_create(rightPanel);
     lv_obj_set_style_text_font(durLbl, UI_FONT, 0);
     lv_obj_align(durLbl, LV_ALIGN_TOP_RIGHT, 0, timeY);
+
+    // ---------------- плашка громкости: закрывает таймлайн на время показа ----------------
+    volPanel = lv_obj_create(rightPanel);
+    lv_obj_set_size(volPanel, innerW, lh + 30);
+    lv_obj_set_pos(volPanel, 0, barY - 8);
+    lv_obj_set_style_radius(volPanel, 8, 0);
+    lv_obj_set_style_border_width(volPanel, 0, 0);
+    lv_obj_set_style_pad_all(volPanel, 0, 0);
+    lv_obj_set_style_bg_color(volPanel, lv_color_hex(0x202020), 0);   // как плашка «Нет обложки»
+    lv_obj_set_style_bg_opa(volPanel, LV_OPA_TRANSP, 0);
+    lv_obj_remove_flag(volPanel, LV_OBJ_FLAG_SCROLLABLE);
+
+    volTitleLbl = lv_label_create(volPanel);
+    lv_obj_set_style_text_font(volTitleLbl, UI_FONT, 0);
+    lv_obj_set_style_text_color(volTitleLbl, lv_color_white(), 0);
+    lv_obj_set_style_text_opa(volTitleLbl, LV_OPA_TRANSP, 0);
+    lv_obj_align(volTitleLbl, LV_ALIGN_TOP_LEFT, 12, 7);
+
+    volValueLbl = lv_label_create(volPanel);
+    lv_obj_set_style_text_font(volValueLbl, UI_FONT, 0);
+    lv_obj_set_style_text_color(volValueLbl, lv_color_white(), 0);
+    lv_obj_set_style_text_opa(volValueLbl, LV_OPA_TRANSP, 0);
+    lv_obj_align(volValueLbl, LV_ALIGN_TOP_RIGHT, -12, 7);
+
+    volBar = lv_bar_create(volPanel);                       // такая же полоса, как у таймлайна
+    lv_obj_set_size(volBar, innerW - 24, 6);
+    lv_obj_align(volBar, LV_ALIGN_TOP_LEFT, 12, 7 + lh + 8);
+    lv_bar_set_range(volBar, 0, 100);
+    lv_bar_set_value(volBar, 0, LV_ANIM_OFF);
+    lv_obj_set_style_bg_color(volBar, lv_color_hex(0x505050), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(volBar, lv_color_white(), LV_PART_INDICATOR);
+    lv_obj_set_style_bg_opa(volBar, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(volBar, LV_OPA_TRANSP, LV_PART_INDICATOR);
+    lv_obj_add_flag(volPanel, LV_OBJ_FLAG_HIDDEN);
 
     // ---------------- «Сервер не запущен» (поверх всего) ----------------
     offlineOverlay = lv_obj_create(scr);
@@ -558,6 +694,7 @@ static void ui_selectionChanged() {
     ui_stateChanged(false);               // без анимации: состояние выбранной сессии сброшено
     ui_appNameChanged();
     ui_bgChanged();
+    ui_hideVolume(false);                 // плашка громкости относится к прежней сессии
 }
 
 // ----------------------------------------------------------------------------
@@ -698,6 +835,23 @@ static void processPacket(uint8_t cmd, const uint8_t *payload, uint16_t length) 
             ui_bgChanged();
             break;
 
+        case CMD_VOLUME_STATE: {
+            if (!isSelected(payload, length) || length < 4) break;
+            uint8_t level = payload[1] > 100 ? 100 : payload[1];
+            bool mute  = payload[2] != 0;
+            bool avail = payload[3] != 0;
+            // плашка выезжает сама, когда громкость или mute изменились (например, в микшере Windows);
+            // первое состояние после выбора сессии и появление/пропажа аудиосессии её не вызывают
+            bool changed = cur.volKnown && cur.volAvail && avail && (cur.volLevel != level || cur.volMute != mute);
+            cur.volLevel = level;
+            cur.volMute = mute;
+            cur.volAvail = avail;
+            cur.volKnown = true;
+            if (changed) ui_showVolume();
+            else if (volShown) ui_volumeContent();       // плашка уже на экране: обновить значения
+            break;
+        }
+
         default:
             break;
     }
@@ -818,6 +972,101 @@ static bool buttonPressed(Button &b) {                  // true один раз 
 }
 
 // ----------------------------------------------------------------------------
+//  Энкодер KY-040
+//  Вращение: громкость выбранного приложения.
+//  Вращение с нажатой кнопкой: переключение медиасессий.
+// ----------------------------------------------------------------------------
+// Таблица состояний квадратурного сигнала (один «щелчок» = один шаг): отсекает дребезг контактов
+constexpr uint8_t RS_START = 0x0, RS_CW_FINAL = 0x1, RS_CW_BEGIN = 0x2, RS_CW_NEXT = 0x3,
+                  RS_CCW_BEGIN = 0x4, RS_CCW_FINAL = 0x5, RS_CCW_NEXT = 0x6;
+constexpr uint8_t DIR_CW = 0x10, DIR_CCW = 0x20;
+
+static const uint8_t encTable[7][4] = {
+    /* RS_START     */ { RS_START,    RS_CW_BEGIN,  RS_CCW_BEGIN, RS_START },
+    /* RS_CW_FINAL  */ { RS_CW_NEXT,  RS_START,     RS_CW_FINAL,  RS_START | DIR_CW },
+    /* RS_CW_BEGIN  */ { RS_CW_NEXT,  RS_CW_BEGIN,  RS_START,     RS_START },
+    /* RS_CW_NEXT   */ { RS_CW_NEXT,  RS_CW_BEGIN,  RS_CW_FINAL,  RS_START },
+    /* RS_CCW_BEGIN */ { RS_CCW_NEXT, RS_START,     RS_CCW_BEGIN, RS_START },
+    /* RS_CCW_FINAL */ { RS_CCW_NEXT, RS_CCW_FINAL, RS_START,     RS_START | DIR_CCW },
+    /* RS_CCW_NEXT  */ { RS_CCW_NEXT, RS_CCW_FINAL, RS_CCW_BEGIN, RS_START },
+};
+
+static volatile int16_t encSteps = 0;          // накопленные шаги: «+» по часовой стрелке
+static volatile uint8_t encState = RS_START;
+
+// прерывание по любому изменению CLK/DT: шаги не теряются, даже пока LVGL рисует кадр
+static void encoderIsr() {
+    uint8_t pinState = (uint8_t)((digitalRead(ENC_DT_PIN) << 1) | digitalRead(ENC_CLK_PIN));
+    uint8_t st = encTable[encState & 0x0F][pinState];
+    encState = st;
+    uint8_t dir = st & 0x30;
+    if (dir == DIR_CW)       encSteps = encSteps + 1;
+    else if (dir == DIR_CCW) encSteps = encSteps - 1;
+}
+
+static bool     encBtnDown = false;            // кнопка энкодера нажата (после антидребезга)
+static bool     encBtnRaw = false;
+static uint32_t encBtnChangedAt = 0;
+static int8_t   pendingSelectId = -1;          // выбранная энкодером сессия, о которой ПК ещё не знает
+static uint32_t pendingSelectAt = 0;
+
+// выбор соседней сессии энкодером: экран переключается сразу, а ПК узнаёт о выборе, когда
+// вращение остановилось (иначе при быстрой прокрутке ПК присылал бы обложку каждой сессии)
+static void selectRelativeDeferred(int8_t dir) {
+    for (int step = 1; step <= MAX_SESSIONS; step++) {
+        int idx = (((selectedId + dir * step) % MAX_SESSIONS) + MAX_SESSIONS) % MAX_SESSIONS;
+        if (sessions[idx].used()) {
+            selectSession((int8_t)idx, false);
+            pendingSelectId = (int8_t)idx;
+            pendingSelectAt = millis() + ENC_SELECT_NOTIFY_MS;
+            return;
+        }
+    }
+}
+
+static void handleEncoder() {
+    uint32_t now = millis();
+
+    // кнопка с антидребезгом (низкий уровень = нажата)
+    bool raw = digitalRead(ENC_SW_PIN) == LOW;
+    if (raw != encBtnRaw) { encBtnRaw = raw; encBtnChangedAt = now; }
+    if (now - encBtnChangedAt > 25 && raw != encBtnDown) encBtnDown = raw;
+
+    // шаги вращения, накопленные прерыванием
+    int16_t steps;
+    noInterrupts();
+    steps = encSteps;
+    encSteps = 0;
+    interrupts();
+    if (ENCODER_REVERSE) steps = -steps;
+
+    if (steps != 0 && serverUp && selectedId >= 0) {
+        if (encBtnDown) {
+            // вращение с нажатой кнопкой: следующая / предыдущая медиасессия (по одной за щелчок)
+            int n = abs(steps) > MAX_SESSIONS ? MAX_SESSIONS : abs(steps);
+            for (int i = 0; i < n; i++) selectRelativeDeferred(steps > 0 ? +1 : -1);
+        } else {
+            // просто вращение: громкость выбранного приложения
+            int delta = steps * VOLUME_STEP_PERCENT;
+            if (delta > 100) delta = 100;
+            if (delta < -100) delta = -100;
+            uint8_t p[2] = { (uint8_t)selectedId, (uint8_t)(int8_t)delta };
+            sendPacket(CMD_VOLUME_STEP, p, 2);
+            ui_showVolume();                                // плашка сразу, не дожидаясь ответа ПК
+        }
+    }
+
+    // ПК узнаёт о сессии, выбранной энкодером, когда вращение закончилось
+    if (pendingSelectId >= 0 && (int32_t)(now - pendingSelectAt) >= 0) {
+        if (pendingSelectId == selectedId) {
+            uint8_t p[1] = { (uint8_t)pendingSelectId };
+            sendPacket(CMD_SELECT_MEDIASESSION, p, 1);
+        }
+        pendingSelectId = -1;
+    }
+}
+
+// ----------------------------------------------------------------------------
 //  Локальное досчитывание времени (между пакетами от ПК)
 // ----------------------------------------------------------------------------
 static void trackTimeTick() {
@@ -868,6 +1117,12 @@ void setup() {
     pinMode(BTN_UP_PIN, INPUT_PULLUP);
     pinMode(BTN_DOWN_PIN, INPUT_PULLUP);
 
+    pinMode(ENC_CLK_PIN, INPUT_PULLUP);
+    pinMode(ENC_DT_PIN, INPUT_PULLUP);
+    pinMode(ENC_SW_PIN, INPUT_PULLUP);
+    attachInterrupt(digitalPinToInterrupt(ENC_CLK_PIN), encoderIsr, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(ENC_DT_PIN), encoderIsr, CHANGE);
+
     lcd.init();
     lcd.setRotation(1);                 // 320x240 альбомная
     lcd.fillScreen(TFT_BLACK);
@@ -890,6 +1145,9 @@ void loop() {
 
     if (buttonPressed(btnUp))   selectRelative(-1);
     if (buttonPressed(btnDown)) selectRelative(+1);
+
+    handleEncoder();
+    ui_volumeTick();
 
     trackTimeTick();
     LVGL_ticker();
